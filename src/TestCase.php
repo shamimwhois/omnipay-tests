@@ -1,98 +1,132 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Omnipay\Tests;
 
+use GuzzleHttp\Psr7\Message;
 use Http\Discovery\HttpClientDiscovery;
 use Http\Discovery\Strategy\MockClientStrategy;
+use Http\Mock\Client as MockClient;
+use InvalidArgumentException;
 use Mockery as m;
 use Mockery\Adapter\Phpunit\MockeryPHPUnitIntegration;
 use Omnipay\Common\Http\Client;
 use Omnipay\Common\Http\ClientInterface;
 use Omnipay\Common\Message\RequestInterface;
+use Override;
 use PHPUnit\Framework\TestCase as PHPUnitTestCase;
 use Psr\Http\Message\ResponseInterface;
 use ReflectionObject;
-use Http\Mock\Client as MockClient;
+use RuntimeException;
 use Symfony\Component\HttpFoundation\Request as HttpRequest;
 
 /**
  * Base class for all Omnipay tests
- *
- * Guzzle mock methods area based on those in GuzzleTestCase
  */
 abstract class TestCase extends PHPUnitTestCase
 {
     use MockeryPHPUnitIntegration;
 
-    /** @var  RequestInterface */
-    private $mockRequest;
+    private static bool $mockStrategyRegistered = false;
 
-    /** @var  MockClient */
-    private $mockClient;
+    private ?RequestInterface $mockRequest = null;
 
-    /** @var ClientInterface */
-    private $httpClient;
+    private ?MockClient $mockClient = null;
 
-    /** @var HttpRequest */
-    private $httpRequest;
+    private ?ClientInterface $httpClient = null;
 
+    private ?HttpRequest $httpRequest = null;
+
+    #[Override]
     protected function setUp(): void
     {
         parent::setUp();
 
-        HttpClientDiscovery::prependStrategy(MockClientStrategy::class);
+        if (!self::$mockStrategyRegistered) {
+            HttpClientDiscovery::prependStrategy(MockClientStrategy::class);
+            self::$mockStrategyRegistered = true;
+        }
     }
 
     /**
      * Converts a string to camel case
-     *
-     * @param string $str
-     * @return string
      */
-    public function camelCase($str)
+    public function camelCase(string $str): string
     {
-        return preg_replace_callback(
-            '/_([a-z])/',
-            function ($match) {
-                return strtoupper($match[1]);
-            },
-            $str
-        );
+        return lcfirst(str_replace(' ', '', ucwords(str_replace('_', ' ', $str))));
     }
 
+    /**
+     * Build a unique sample value that matches the default parameter type.
+     *
+     * Boolean, integer, float and enumerated array defaults no longer receive a
+     * random string (which caused false failures). Currency is always a valid
+     * uppercase ISO code because AbstractGateway::getCurrency() uppercases.
+     */
+    public function makeUniqueValue(string $key, mixed $default): mixed
+    {
+        if (strcasecmp($key, 'currency') === 0) {
+            return $this->makeUniqueCurrency($default);
+        }
+
+        return match (true) {
+            is_bool($default) => !$default,
+            is_int($default) => random_int(100000, 999999),
+            is_float($default) => random_int(1000, 9999) / 100,
+            is_array($default) && $default !== [] => $default[array_rand($default)],
+            is_array($default) => ['item_' . uniqid('', true)],
+            default => uniqid('', true),
+        };
+    }
+
+    /**
+     * Normalize a value to what a typical Omnipay getter will return.
+     */
+    public function expectedParameterValue(string $key, mixed $value): mixed
+    {
+        if (strcasecmp($key, 'currency') === 0 && is_string($value)) {
+            return strtoupper($value);
+        }
+
+        return $value;
+    }
 
     /**
      * Get all of the mocked requests
      *
-     * @return array
+     * @return list<\Psr\Http\Message\RequestInterface>
      */
-    public function getMockedRequests()
+    public function getMockedRequests(): array
     {
-        return $this->mockClient->getRequests();
+        return $this->getMockClient()->getRequests();
     }
 
     /**
      * Get a mock response for a client by mock file name
-     *
-     * @param string $path Relative path to the mock response file
-     *
-     * @return ResponseInterface
      */
-    public function getMockHttpResponse($path)
+    public function getMockHttpResponse(string|ResponseInterface $path): ResponseInterface
     {
         if ($path instanceof ResponseInterface) {
             return $path;
         }
 
-        $ref = new ReflectionObject($this);
-        $dir = dirname($ref->getFileName());
+        $dir = dirname((new ReflectionObject($this))->getFileName() ?: '');
+        $file = array_find(
+            [$dir . '/Mock/' . $path, $dir . '/../Mock/' . $path],
+            static fn (string $candidate): bool => is_file($candidate)
+        );
 
-        // if mock file doesn't exist, check parent directory
-        if (!file_exists($dir.'/Mock/'.$path) && file_exists($dir.'/../Mock/'.$path)) {
-            return \GuzzleHttp\Psr7\Message::parseResponse(file_get_contents($dir.'/../Mock/'.$path));
+        if ($file === null) {
+            throw new InvalidArgumentException(sprintf('Mock HTTP response file not found: %s', $path));
         }
 
-        return \GuzzleHttp\Psr7\Message::parseResponse(file_get_contents($dir.'/Mock/'.$path));
+        $contents = file_get_contents($file);
+        if ($contents === false) {
+            throw new RuntimeException(sprintf('Unable to read mock HTTP response file: %s', $file));
+        }
+
+        return Message::parseResponse($contents);
     }
 
     /**
@@ -102,34 +136,36 @@ abstract class TestCase extends PHPUnitTestCase
      * Mock/ subdirectory of the current class. A mock response is added to the next
      * request sent by the client.
      *
-     * An array of path can be provided and the next x number of client requests are
+     * An array of paths can be provided and the next x number of client requests are
      * mocked in the order of the array where x = the array length.
      *
-     * @param array|string $paths Path to files within the Mock folder of the service
-     *
-     * @return void returns the created mock plugin
+     * @param array<int, string|ResponseInterface>|string|ResponseInterface $paths
      */
-    public function setMockHttpResponse($paths)
+    public function setMockHttpResponse(array|string|ResponseInterface $paths): void
     {
-        foreach ((array) $paths as $path) {
-            $this->mockClient->addResponse($this->getMockHttpResponse($path));
+        foreach (is_array($paths) ? $paths : [$paths] as $path) {
+            $this->getMockClient()->addResponse($this->getMockHttpResponse($path));
         }
     }
 
     /**
      * Helper method used by gateway test classes to generate a valid test credit card
+     *
+     * @return array<string, mixed>
      */
-    public function getValidCard()
+    public function getValidCard(): array
     {
-        return array(
+        return [
             'firstName' => 'Example',
             'lastName' => 'User',
             'number' => '4111111111111111',
-            'expiryMonth' => rand(1, 12),
-            'expiryYear' => gmdate('Y') + rand(1, 5),
-            'cvv' => rand(100, 999),
+            'expiryMonth' => random_int(1, 12),
+            'expiryYear' => ((int) gmdate('Y')) + random_int(1, 5),
+            'cvv' => random_int(100, 999),
+            'email' => 'example.user@example.com',
             'billingAddress1' => '123 Billing St',
             'billingAddress2' => 'Billsville',
+            'billingAddress3' => 'Building B, Room 308',
             'billingCity' => 'Billstown',
             'billingPostcode' => '12345',
             'billingState' => 'CA',
@@ -137,49 +173,64 @@ abstract class TestCase extends PHPUnitTestCase
             'billingPhone' => '(555) 123-4567',
             'shippingAddress1' => '123 Shipping St',
             'shippingAddress2' => 'Shipsville',
+            'shippingAddress3' => 'Building S, Room 114',
             'shippingCity' => 'Shipstown',
             'shippingPostcode' => '54321',
             'shippingState' => 'NY',
             'shippingCountry' => 'US',
             'shippingPhone' => '(555) 987-6543',
-        );
+        ];
     }
 
-    public function getMockRequest()
+    public function getMockRequest(): RequestInterface
     {
-        if (null === $this->mockRequest) {
-            $this->mockRequest = m::mock(RequestInterface::class);
-        }
-
-        return $this->mockRequest;
+        return $this->mockRequest ??= m::mock(RequestInterface::class);
     }
 
-    public function getMockClient()
+    public function getMockClient(): MockClient
     {
-        if (null === $this->mockClient) {
-            $this->mockClient = new MockClient();
-        }
-
-        return $this->mockClient;
+        return $this->mockClient ??= new MockClient();
     }
 
-    public function getHttpClient()
+    public function getHttpClient(): ClientInterface
     {
-        if (null === $this->httpClient) {
-            $this->httpClient = new Client(
-                $this->getMockClient()
-            );
-        }
-
-        return $this->httpClient;
+        return $this->httpClient ??= new Client($this->getMockClient());
     }
 
-    public function getHttpRequest()
+    public function getHttpRequest(): HttpRequest
     {
-        if (null === $this->httpRequest) {
-            $this->httpRequest = new HttpRequest;
+        return $this->httpRequest ??= new HttpRequest();
+    }
+
+    /**
+     * @return array{0: string, 1: string}
+     */
+    public function parameterAccessors(string $key): array
+    {
+        $name = ucfirst($this->camelCase($key));
+
+        return ['get' . $name, 'set' . $name];
+    }
+
+    private function makeUniqueCurrency(mixed $default): string
+    {
+        $currencies = ['USD', 'EUR', 'GBP', 'AUD', 'CAD', 'JPY', 'NZD', 'CHF'];
+
+        if (is_array($default) && $default !== []) {
+            $choice = $default[array_rand($default)];
+
+            return is_string($choice) ? strtoupper($choice) : 'USD';
         }
 
-        return $this->httpRequest;
+        if (is_string($default) && $default !== '') {
+            $current = strtoupper($default);
+
+            return array_find(
+                $currencies,
+                static fn (string $code): bool => $code !== $current
+            ) ?? $currencies[0];
+        }
+
+        return $currencies[array_rand($currencies)];
     }
 }
